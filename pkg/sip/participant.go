@@ -35,6 +35,12 @@ const (
 const (
 	AttrSIPCallIDFull = livekit.AttrSIPPrefix + "callIDFull"
 	AttrSIPCallTag    = livekit.AttrSIPPrefix + "callTag"
+
+	// AttrSIPAudioCodec is the negotiated audio codec as named in SDP, e.g. "PCMA/8000" or "G722/8000".
+	AttrSIPAudioCodec = livekit.AttrSIPPrefix + "audioCodec"
+	// AttrSIPAudioSampleRate is the real sample rate of the negotiated audio codec in Hz.
+	// It differs from the SDP clock rate for G.722, which is 16000 Hz but declared as 8000 in SDP.
+	AttrSIPAudioSampleRate = livekit.AttrSIPPrefix + "audioSampleRate"
 )
 
 var headerToLog = map[string]string{

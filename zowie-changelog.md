@@ -17,6 +17,23 @@ which bumps protocol to v1.45.1 (protocol #1456 "Dropping sip affinity use"); fr
 affinity 1 for every node, so outbound routing ignores load, `max_active_calls` and `sip_trunk_ids`.
 The newest upstream commit that still has affinity is 450ffb7 (#638, 2026-03-28).
 
+## zowie-1.1.0 (2026-10-21)
+
+### Expose the negotiated audio codec as SIP participant attributes
+
+- **Commit:** this PR
+- **Files:** `pkg/sip/media_attrs.go`, `pkg/sip/media_attrs_test.go`, `pkg/sip/participant.go`,
+  `pkg/sip/inbound.go`, `pkg/sip/outbound.go`
+- **What:** two new participant attributes: `sip.audioCodec` (SDP name, e.g. `PCMA/8000`) and
+  `sip.audioSampleRate` (the codec's real sample rate: `8000` for G.711, `16000` for G.722, whose SDP clock rate
+  says 8000). Inbound calls carry them from the moment the participant joins, since the codec is negotiated
+  before the room is joined. Outbound calls get them through `SetAttributes` once the callee answers. The
+  livekit-agent reads `sip.audioSampleRate` to stream speech to Azure at 8 kHz on narrowband calls, for numbers
+  that opt in; without the attribute it keeps 16 kHz.
+- **Deploy order:** any. An agent that does not read the attributes ignores them.
+- **Upstream status:** Zowie only. Upstream keeps the codec only in `SIPCallInfo.AudioCodec` for analytics
+  (checked on upstream main, 2026-10-20).
+
 ## zowie-1.0.0 (2026-10-21)
 
 The first tag: the code of `hotfix/srtp-stream-leak`, which images were built from until then, plus this
