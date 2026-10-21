@@ -15,6 +15,7 @@
 package sip
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"slices"
@@ -28,9 +29,12 @@ import (
 	"github.com/livekit/media-sdk/rtp"
 	"github.com/livekit/media-sdk/tones"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/livekit/sip/pkg/media/opus"
 )
 
 const dtmfToneFrameCount = int(dtmfRecordingToneDur / rtp.DefFrameDur)
@@ -142,11 +146,11 @@ func TestDTMFToneFramesAddNeverBlocks(t *testing.T) {
 type recordingPCMWriter struct {
 	mu     sync.Mutex
 	frames []msdk.PCM16Sample
-	closed bool
 }
 
 func (w *recordingPCMWriter) String() string  { return "recordingPCMWriter" }
 func (w *recordingPCMWriter) SampleRate() int { return RoomSampleRate }
+func (w *recordingPCMWriter) Close() error    { return nil }
 
 func (w *recordingPCMWriter) WriteSample(sample msdk.PCM16Sample) error {
 	w.mu.Lock()
@@ -155,26 +159,115 @@ func (w *recordingPCMWriter) WriteSample(sample msdk.PCM16Sample) error {
 	return nil
 }
 
-func (w *recordingPCMWriter) Close() error {
+type recordingOpusWriter struct {
+	mu      sync.Mutex
+	packets []opus.Sample
+	closed  bool
+}
+
+func (w *recordingOpusWriter) String() string  { return "recordingOpusWriter" }
+func (w *recordingOpusWriter) SampleRate() int { return RoomSampleRate }
+
+func (w *recordingOpusWriter) WriteSample(sample opus.Sample) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.packets = append(w.packets, slices.Clone(sample))
+	return nil
+}
+
+func (w *recordingOpusWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.closed = true
 	return nil
 }
 
-func (w *recordingPCMWriter) snapshot() ([]msdk.PCM16Sample, bool) {
+func (w *recordingOpusWriter) snapshot() ([]opus.Sample, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return slices.Clone(w.frames), w.closed
+	return slices.Clone(w.packets), w.closed
+}
+
+func newTestDTMFOpusWriter(t *testing.T, out opus.Writer) *dtmfOpusWriter {
+	w, err := newDTMFOpusWriter(out, logger.GetLogger())
+	require.NoError(t, err)
+	return w
+}
+
+func isCachedSilence(p opus.Sample) bool {
+	return bytes.Equal(p, dtmfRecordingSilence)
+}
+
+func TestDTMFRecordingSilenceDecodesToZeros(t *testing.T) {
+	out := &recordingPCMWriter{}
+	dec, err := opus.Decode(out, channels, logger.GetLogger())
+	require.NoError(t, err)
+	for range 3 {
+		require.NoError(t, dec.WriteSample(dtmfRecordingSilence))
+	}
+	require.Len(t, out.frames, 3)
+	for _, frame := range out.frames {
+		require.Len(t, frame, RoomSampleRate/int(time.Second/rtp.DefFrameDur))
+		require.True(t, isSilent(frame))
+	}
+}
+
+func TestDTMFOpusWriterSendsCachedSilenceWithoutTones(t *testing.T) {
+	out := &recordingOpusWriter{}
+	w := newTestDTMFOpusWriter(t, out)
+	g := newDTMFToneFrames()
+	buf := newFrameBuf()
+	for range 100 {
+		require.NoError(t, w.WriteFrame(buf, g.Next(buf, rtp.DefFrameDur)))
+	}
+	packets, _ := out.snapshot()
+	require.Len(t, packets, 100)
+	for _, p := range packets {
+		require.True(t, isCachedSilence(p))
+	}
+}
+
+// The encoder must settle on dtmfRecordingSilence by itself after a tone. If a libopus update changes the packet
+// it produces for silence, the encoder never matches it and runs for dtmfRecordingMaxTailFrames after every tone.
+func TestDTMFOpusWriterEncodesTonesAndSettlesOnCachedSilence(t *testing.T) {
+	out := &recordingOpusWriter{}
+	w := newTestDTMFOpusWriter(t, out)
+	g := newDTMFToneFrames()
+	buf := newFrameBuf()
+	write := func(n int) {
+		for range n {
+			require.NoError(t, w.WriteFrame(buf, g.Next(buf, rtp.DefFrameDur)))
+		}
+	}
+	for _, digits := range []string{"5", "1#", "0"} {
+		write(10)
+		for _, d := range []byte(digits) {
+			g.Add(d)
+		}
+		before, _ := out.snapshot()
+		write(len(digits)*dtmfToneFrameCount + dtmfRecordingMaxTailFrames + 10)
+		after, _ := out.snapshot()
+		packets := after[len(before):]
+
+		for _, p := range packets[:len(digits)*dtmfToneFrameCount] {
+			require.False(t, isCachedSilence(p), "tone frame sent as cached silence")
+		}
+		settled := slices.IndexFunc(packets, isCachedSilence)
+		require.Positive(t, settled)
+		require.Less(t, settled, len(digits)*dtmfToneFrameCount+dtmfRecordingMaxTailFrames/2, "encoder did not settle on dtmfRecordingSilence")
+		for _, p := range packets[settled:] {
+			require.True(t, isCachedSilence(p))
+		}
+	}
 }
 
 func TestRunDTMFRecordingTrackWritesSilenceAndTones(t *testing.T) {
-	out := &recordingPCMWriter{}
+	out := &recordingOpusWriter{}
 	frames := newDTMFToneFrames()
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		assert.NoError(t, runDTMFRecordingTrack(out, frames, stop))
+		assert.NoError(t, runDTMFRecordingTrack(newTestDTMFOpusWriter(t, out), frames, stop))
 		close(done)
 	}()
 
@@ -185,40 +278,38 @@ func TestRunDTMFRecordingTrackWritesSilenceAndTones(t *testing.T) {
 	frames.Add('9')
 	require.Eventually(t, func() bool {
 		written, _ := out.snapshot()
-		return slices.ContainsFunc(written, func(f msdk.PCM16Sample) bool { return !isSilent(f) })
+		return slices.ContainsFunc(written, func(p opus.Sample) bool { return !isCachedSilence(p) })
 	}, time.Second, rtp.DefFrameDur)
 
 	close(stop)
 	<-done
 	written, closed := out.snapshot()
 	require.True(t, closed)
-	require.True(t, isSilent(written[0]))
-	for _, frame := range written {
-		require.Len(t, frame, RoomSampleRate/int(time.Second/rtp.DefFrameDur))
-	}
+	require.True(t, isCachedSilence(written[0]))
 }
 
-type stallingPCMWriter struct {
-	recordingPCMWriter
+type stallingOpusWriter struct {
+	recordingOpusWriter
 	stallAt  int
 	stallFor time.Duration
 }
 
-func (w *stallingPCMWriter) WriteSample(sample msdk.PCM16Sample) error {
+func (w *stallingOpusWriter) WriteSample(sample opus.Sample) error {
 	written, _ := w.snapshot()
 	if len(written) == w.stallAt {
 		time.Sleep(w.stallFor)
 	}
-	return w.recordingPCMWriter.WriteSample(sample)
+	return w.recordingOpusWriter.WriteSample(sample)
 }
 
 func TestRunDTMFRecordingTrackKeepsUpWithTheClockAfterAStall(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		out := &stallingPCMWriter{stallAt: 5, stallFor: 5*rtp.DefFrameDur + rtp.DefFrameDur/2}
+		out := &stallingOpusWriter{stallAt: 5, stallFor: 5*rtp.DefFrameDur + rtp.DefFrameDur/2}
+		w := newTestDTMFOpusWriter(t, out)
 		stop := make(chan struct{})
 		done := make(chan struct{})
 		go func() {
-			assert.NoError(t, runDTMFRecordingTrack(out, newDTMFToneFrames(), stop))
+			assert.NoError(t, runDTMFRecordingTrack(w, newDTMFToneFrames(), stop))
 			close(done)
 		}()
 
@@ -232,26 +323,27 @@ func TestRunDTMFRecordingTrackKeepsUpWithTheClockAfterAStall(t *testing.T) {
 	})
 }
 
-type failingPCMWriter struct {
-	recordingPCMWriter
+type failingOpusWriter struct {
+	recordingOpusWriter
 	failFrom, failTo int
 	calls            int
 }
 
-func (w *failingPCMWriter) WriteSample(sample msdk.PCM16Sample) error {
+func (w *failingOpusWriter) WriteSample(sample opus.Sample) error {
 	w.calls++
 	if w.calls > w.failFrom && w.calls <= w.failTo {
 		return errors.New("write failed")
 	}
-	return w.recordingPCMWriter.WriteSample(sample)
+	return w.recordingOpusWriter.WriteSample(sample)
 }
 
 func TestRunDTMFRecordingTrackSurvivesShortWriteErrors(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		out := &failingPCMWriter{failFrom: 5, failTo: 5 + dtmfRecordingMaxErrors - 1}
+		out := &failingOpusWriter{failFrom: 5, failTo: 5 + dtmfRecordingMaxErrors - 1}
+		w := newTestDTMFOpusWriter(t, out)
 		stop := make(chan struct{})
 		done := make(chan error, 1)
-		go func() { done <- runDTMFRecordingTrack(out, newDTMFToneFrames(), stop) }()
+		go func() { done <- runDTMFRecordingTrack(w, newDTMFToneFrames(), stop) }()
 
 		time.Sleep(2*time.Second + rtp.DefFrameDur/2)
 		synctest.Wait()
@@ -265,10 +357,11 @@ func TestRunDTMFRecordingTrackSurvivesShortWriteErrors(t *testing.T) {
 
 func TestRunDTMFRecordingTrackStopsOnPersistentWriteErrors(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		out := &failingPCMWriter{failFrom: 5, failTo: math.MaxInt}
+		out := &failingOpusWriter{failFrom: 5, failTo: math.MaxInt}
+		w := newTestDTMFOpusWriter(t, out)
 		stop := make(chan struct{})
 		done := make(chan error, 1)
-		go func() { done <- runDTMFRecordingTrack(out, newDTMFToneFrames(), stop) }()
+		go func() { done <- runDTMFRecordingTrack(w, newDTMFToneFrames(), stop) }()
 
 		require.Error(t, <-done)
 		_, closed := out.snapshot()

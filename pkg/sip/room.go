@@ -594,14 +594,14 @@ func (r *Room) publishDTMFRecordingTrack(p *lksdk.LocalParticipant) error {
 		return err
 	}
 	ow := msdk.FromSampleWriter[opus.Sample](track, RoomSampleRate, rtp.DefFrameDur)
-	pw, err := opus.Encode(ow, channels, r.log)
+	w, err := newDTMFOpusWriter(ow, r.log)
 	if err != nil {
 		return err
 	}
 	frames := newDTMFToneFrames()
 	r.dtmfRec.Store(frames)
 	go func() {
-		if err := runDTMFRecordingTrack(pw, frames, r.closed.Watch()); err != nil {
+		if err := runDTMFRecordingTrack(w, frames, r.closed.Watch()); err != nil {
 			r.dtmfRecEnd.Store(true)
 			r.dtmfRec.CompareAndSwap(frames, nil)
 			r.log.Warnw("DTMF recording track stopped after repeated write errors", err)

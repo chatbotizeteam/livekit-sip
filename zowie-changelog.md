@@ -38,6 +38,12 @@ Minor: a new feature, on by default.
     with the time it took ("DTMF recording track published").
   - Frames are counted against the wall clock, so a late loop catches up instead of shifting later tones
     earlier in the recording.
+  - Silence goes out as a fixed 3-byte Opus packet (`f8 ff fe`, the packet libopus itself settles on for
+    silence after a tone) instead of being encoded: the encoder runs only for a tone and until it settles
+    again. Encoding silence costs about as much CPU as encoding speech; with the fixed packet 100 tracks
+    take ~0.2 of a core instead of ~1.2 (local benchmark). A test fails if a libopus update changes the packet.
+  - The tones are the standard DTMF pairs, so the digits can be told apart in the recording (and decoded from
+    it, PINs and card numbers included). This is deliberate: recordings show which key was pressed.
   - A write error does not stop the track; 50 failed writes in a row (1 s) do, as on the microphone path, and
     are logged ("DTMF recording track stopped after repeated write errors"). Later digits are logged with the
     reason "track stopped".
