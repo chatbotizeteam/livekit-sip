@@ -436,6 +436,9 @@ func (c *outboundCall) connectToRoom(ctx context.Context, lkNew RoomConfig, getR
 		_ = r.Close()
 		return err
 	}
+	if c.c.conf.DTMFRecordingTone {
+		r.PublishDTMFRecordingTrack()
+	}
 	c.lkRoom = r
 	c.lkRoomIn = local
 	return nil
@@ -692,6 +695,7 @@ func (c *outboundCall) handleDTMF(ev dtmf.Event) {
 	if c.lkRoom == nil {
 		return
 	}
+	c.lkRoom.RecordDTMF(ev.Digit)
 	_ = c.lkRoom.SendData(&livekit.SipDTMF{
 		Code:  uint32(ev.Code),
 		Digit: string([]byte{ev.Digit}),

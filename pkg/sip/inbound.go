@@ -1337,6 +1337,9 @@ func (c *inboundCall) publishTrack() error {
 		return err
 	}
 	c.media.WriteAudioTo(local)
+	if c.s.conf.DTMFRecordingTone {
+		c.lkRoom.PublishDTMFRecordingTrack()
+	}
 	return nil
 }
 
@@ -1379,6 +1382,7 @@ func (c *inboundCall) playAudio(ctx context.Context, frames []msdk.PCM16Sample) 
 
 func (c *inboundCall) handleDTMF(tone dtmf.Event) {
 	if c.forwardDTMF.Load() {
+		c.lkRoom.RecordDTMF(tone.Digit)
 		_ = c.lkRoom.SendData(&livekit.SipDTMF{
 			Code:  uint32(tone.Code),
 			Digit: string([]byte{tone.Digit}),

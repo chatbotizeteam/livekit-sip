@@ -218,6 +218,12 @@ func (r *testRoom) NewParticipantTrack(sampleRate int) (msdk.WriteCloser[msdk.PC
 	return &noOpWriter{}, nil
 }
 
+func (r *testRoom) PublishDTMFRecordingTrack() {}
+
+func (r *testRoom) RecordDTMF(digit byte) {
+	r.room.RecordDTMF(digit)
+}
+
 // noOpWriter is a no-op implementation of msdk.WriteCloser for testing
 type noOpWriter struct{}
 
