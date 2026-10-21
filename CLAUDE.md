@@ -23,7 +23,9 @@ integration branch: upstream plus the changes listed in `zowie-changelog.md`. Re
 4. Ship it with an MR in zowie-voicebot that sets `SIP_TAG` in `livekit-sip/sip-source.conf`. Follow the
    deploy order in the changelog entry, if there is one.
 
-Never move or delete a pushed tag: images are traced back to it, and rollback means pinning the previous tag.
+Pushed tags are immutable: the repository ruleset "Protect zowie release tags" blocks update, deletion and
+force push of `refs/tags/zowie-*` for everyone but repository admins. Images are traced back to their tag, and
+rollback means pinning the previous one, so even admins must not move a tag; release a new version instead.
 
 When rebasing `zowie-custom` onto a newer upstream, walk the changelog: carry the "Zowie only" entries, drop
 the ones upstream has shipped, and update the "Base" section.
