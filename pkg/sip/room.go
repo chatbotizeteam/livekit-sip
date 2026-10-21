@@ -182,6 +182,7 @@ type Room struct {
 	stats      *RoomStats
 	dtmfRec    atomic.Pointer[dtmfToneFrames]
 	dtmfRecOn  atomic.Bool
+	dtmfRecEnd atomic.Bool
 }
 
 type ParticipantConfig struct {
@@ -599,7 +600,13 @@ func (r *Room) publishDTMFRecordingTrack(p *lksdk.LocalParticipant) error {
 	}
 	frames := newDTMFToneFrames()
 	r.dtmfRec.Store(frames)
-	go runDTMFRecordingTrack(pw, frames, r.closed.Watch())
+	go func() {
+		if err := runDTMFRecordingTrack(pw, frames, r.closed.Watch()); err != nil {
+			r.dtmfRecEnd.Store(true)
+			r.dtmfRec.CompareAndSwap(frames, nil)
+			r.log.Warnw("DTMF recording track stopped after repeated write errors", err)
+		}
+	}()
 	return nil
 }
 
@@ -611,7 +618,11 @@ func (r *Room) RecordDTMF(digit byte) {
 	}
 	frames := r.dtmfRec.Load()
 	if frames == nil {
-		r.log.Infow("DTMF digit left out of the recording", "reason", "track not published")
+		reason := "track not published"
+		if r.dtmfRecEnd.Load() {
+			reason = "track stopped"
+		}
+		r.log.Infow("DTMF digit left out of the recording", "reason", reason)
 		return
 	}
 	if !frames.Add(digit) {

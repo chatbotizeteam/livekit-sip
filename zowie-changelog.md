@@ -38,11 +38,25 @@ Minor: a new feature, on by default.
     with the time it took ("DTMF recording track published").
   - Frames are counted against the wall clock, so a late loop catches up instead of shifting later tones
     earlier in the recording.
-- **Config:** `dtmf_recording_tone`, **on by default**; set it to `false` to turn it off.
-- **Deploy order:** roll out the livekit-agent change from platform/monorepo!17746 (egress `DUAL_CHANNEL_AGENT`,
-  voicemail detection on the microphone track only) in EU and US before a SIP image with this change. With the
-  old agent, outbound voicemail detection can pick the silent DTMF track and the tones land on the agent's
-  recording channel.
+  - A write error does not stop the track; 50 failed writes in a row (1 s) do, as on the microphone path, and
+    are logged ("DTMF recording track stopped after repeated write errors"). Later digits are logged with the
+    reason "track stopped".
+- **Config:** `dtmf_recording_tone`, **on by default**; set it to `false` to turn it off. The key has to be in
+  the config file: the aws-iac template for the EC2 hosts must render the value (`true`/`false`), not only
+  `true` when the role variable is set, or setting the variable to `false` leaves the track on. Until it does,
+  turning it off in production means going back to a SIP image without this change.
+- **Deploy order:**
+  1. The livekit-agent change from platform/monorepo!17746 (egress `DUAL_CHANNEL_AGENT`, voicemail detection on
+     the microphone track only) deployed in EU and US, rolling deploy finished. With the old agent, outbound
+     voicemail detection can pick the silent DTMF track and the tones land on the agent's recording channel.
+  2. zowie-voicebot builds the image from a `zowie-*` tag (zowie-voicebot!92; before it, `sip-source.conf` builds
+     from a branch). Ship `zowie-1.0.0` through it first, then bump to `zowie-1.1.0` separately.
+  3. The new image goes out through aws-iac (`livekit_sip_version`) and ansible to **every** `tag_Role_LiveKitSIP`
+     group of a region in one window (prod-eu1: public, kruk, mubi; prod-us1). A SIP host without this change
+     mixes every audio track in the room, so when the two legs of a transfer run on different versions, the
+     other party hears the key presses. The same applies to a rollback: move all groups back together.
+  - **Rollback of the agent** below !17746 while the hosts run `zowie-1.1.0` brings back the problem from step 1:
+    move the SIP hosts back first.
 - **Upstream status:** Zowie only.
 
 ## zowie-1.0.0 (2026-10-21)

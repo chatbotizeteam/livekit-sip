@@ -15,6 +15,8 @@
 package sip
 
 import (
+	"errors"
+	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -27,6 +29,7 @@ import (
 	"github.com/livekit/media-sdk/tones"
 	"github.com/livekit/protocol/livekit"
 	lksdk "github.com/livekit/server-sdk-go/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -171,7 +174,7 @@ func TestRunDTMFRecordingTrackWritesSilenceAndTones(t *testing.T) {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		runDTMFRecordingTrack(out, frames, stop)
+		assert.NoError(t, runDTMFRecordingTrack(out, frames, stop))
 		close(done)
 	}()
 
@@ -215,7 +218,7 @@ func TestRunDTMFRecordingTrackKeepsUpWithTheClockAfterAStall(t *testing.T) {
 		stop := make(chan struct{})
 		done := make(chan struct{})
 		go func() {
-			runDTMFRecordingTrack(out, newDTMFToneFrames(), stop)
+			assert.NoError(t, runDTMFRecordingTrack(out, newDTMFToneFrames(), stop))
 			close(done)
 		}()
 
@@ -226,6 +229,51 @@ func TestRunDTMFRecordingTrackKeepsUpWithTheClockAfterAStall(t *testing.T) {
 
 		close(stop)
 		<-done
+	})
+}
+
+type failingPCMWriter struct {
+	recordingPCMWriter
+	failFrom, failTo int
+	calls            int
+}
+
+func (w *failingPCMWriter) WriteSample(sample msdk.PCM16Sample) error {
+	w.calls++
+	if w.calls > w.failFrom && w.calls <= w.failTo {
+		return errors.New("write failed")
+	}
+	return w.recordingPCMWriter.WriteSample(sample)
+}
+
+func TestRunDTMFRecordingTrackSurvivesShortWriteErrors(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := &failingPCMWriter{failFrom: 5, failTo: 5 + dtmfRecordingMaxErrors - 1}
+		stop := make(chan struct{})
+		done := make(chan error, 1)
+		go func() { done <- runDTMFRecordingTrack(out, newDTMFToneFrames(), stop) }()
+
+		time.Sleep(2*time.Second + rtp.DefFrameDur/2)
+		synctest.Wait()
+		written, _ := out.snapshot()
+		require.Len(t, written, int(2*time.Second/rtp.DefFrameDur)-(dtmfRecordingMaxErrors-1))
+
+		close(stop)
+		require.NoError(t, <-done)
+	})
+}
+
+func TestRunDTMFRecordingTrackStopsOnPersistentWriteErrors(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := &failingPCMWriter{failFrom: 5, failTo: math.MaxInt}
+		stop := make(chan struct{})
+		done := make(chan error, 1)
+		go func() { done <- runDTMFRecordingTrack(out, newDTMFToneFrames(), stop) }()
+
+		require.Error(t, <-done)
+		_, closed := out.snapshot()
+		require.True(t, closed)
+		require.Equal(t, 5+dtmfRecordingMaxErrors, out.calls)
 	})
 }
 

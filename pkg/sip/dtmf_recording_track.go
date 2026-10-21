@@ -30,6 +30,8 @@ const (
 	dtmfRecordingToneDur    = 120 * time.Millisecond
 	dtmfRecordingToneVolume = math.MaxInt16 / 4
 	dtmfRecordingQueueSize  = 16
+	// dtmfRecordingMaxErrors consecutive failed writes (1 s of frames) stop the track, as on the microphone path.
+	dtmfRecordingMaxErrors = 50
 
 	dtmfRecordingTrackSuffix = "-dtmf-recording"
 	dtmfRecordingTrackSource = livekit.TrackSource_SCREEN_SHARE_AUDIO
@@ -90,23 +92,30 @@ func (g *dtmfToneFrames) Next(buf msdk.PCM16Sample, dur time.Duration) {
 // so a track carrying tones only would place every tone right after the previous one in the recording.
 // For the same reason it counts frames against the clock, not ticks: a ticker drops ticks when the loop
 // is late, and every dropped tick would leave the track a frame behind for the rest of the call.
-func runDTMFRecordingTrack(out msdk.PCM16Writer, frames *dtmfToneFrames, stop <-chan struct{}) {
+// It returns nil when stop is closed, or the last error after dtmfRecordingMaxErrors failed writes in a row.
+func runDTMFRecordingTrack(out msdk.PCM16Writer, frames *dtmfToneFrames, stop <-chan struct{}) error {
 	defer out.Close()
 	buf := make(msdk.PCM16Sample, out.SampleRate()/int(time.Second/rtp.DefFrameDur))
 	ticker := time.NewTicker(rtp.DefFrameDur)
 	defer ticker.Stop()
 	next := time.Now().Add(rtp.DefFrameDur)
+	errorCnt := 0
 	for {
 		select {
 		case <-stop:
-			return
+			return nil
 		case <-ticker.C:
 		}
 		for now := time.Now(); !next.After(now); next = next.Add(rtp.DefFrameDur) {
 			frames.Next(buf, rtp.DefFrameDur)
 			if err := out.WriteSample(buf); err != nil {
-				return
+				errorCnt++
+				if errorCnt >= dtmfRecordingMaxErrors {
+					return err
+				}
+				continue
 			}
+			errorCnt = 0
 		}
 	}
 }
