@@ -21,7 +21,7 @@ The newest upstream commit that still has affinity is 450ffb7 (#638, 2026-03-28)
 
 ### Expose the negotiated audio codec as SIP participant attributes
 
-- **Commit:** this PR
+- **Commit:** [#2](https://github.com/chatbotizeteam/livekit-sip/pull/2)
 - **Files:** `pkg/sip/media_attrs.go`, `pkg/sip/media_attrs_test.go`, `pkg/sip/participant.go`,
   `pkg/sip/inbound.go`, `pkg/sip/outbound.go`
 - **What:** two new participant attributes: `sip.audioCodec` (SDP name, e.g. `PCMA/8000`) and
@@ -32,7 +32,9 @@ The newest upstream commit that still has affinity is 450ffb7 (#638, 2026-03-28)
   that opt in; without the attribute it keeps 16 kHz.
 - **Deploy order:** any. An agent that does not read the attributes ignores them.
 - **Upstream status:** Zowie only. Upstream keeps the codec only in `SIPCallInfo.AudioCodec` for analytics
-  (checked on upstream main, 2026-10-20).
+  (checked on upstream main, 2026-10-20). Upstream 21fa436 (#837, "Support codec parameters") moves the codec
+  to `audio.Info`; when rebasing past it, rewrite `withAudioCodecAttrs` and keep `sip.audioCodec` as
+  `name/clockRate` (e.g. `PCMA/8000`), which `media_attrs_test.go` checks.
 
 ## zowie-1.0.0 (2026-10-21)
 
