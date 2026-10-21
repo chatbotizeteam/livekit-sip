@@ -154,6 +154,8 @@ type RoomInterface interface {
 	CloseWithReason(reason livekit.DisconnectReason) error
 	Participant() ParticipantInfo
 	NewParticipantTrack(sampleRate int) (msdk.WriteCloser[msdk.PCM16Sample], error)
+	PublishDTMFRecordingTrack()
+	RecordDTMF(digit byte)
 	SendData(data lksdk.DataPacket, opts ...lksdk.DataPublishOption) error
 	NewTrack() *mixer.Input
 }
@@ -178,6 +180,7 @@ type Room struct {
 	stopped    core.Fuse
 	closed     core.Fuse
 	stats      *RoomStats
+	dtmfRec    atomic.Pointer[dtmfToneFrames]
 }
 
 type ParticipantConfig struct {
@@ -274,6 +277,10 @@ func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemotePa
 	log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", pub.SID(), "trackName", pub.Name())
 	if pub.Kind() != lksdk.TrackKindAudio {
 		log.Debugw("skipping non-audio track")
+		return
+	}
+	if isDTMFRecordingTrack(rp.Kind(), rp.Identity(), pub.Source(), pub.Name()) {
+		log.Debugw("skipping DTMF recording track")
 		return
 	}
 	log.Debugw("subscribing to a track")
@@ -549,6 +556,56 @@ func (r *Room) NewParticipantTrack(sampleRate int) (msdk.WriteCloser[msdk.PCM16S
 		return nil, err
 	}
 	return newMediaWriterCount(pw, &r.stats.PublishedFrames, &r.stats.PublishedSamples), nil
+}
+
+// PublishDTMFRecordingTrack publishes, in the background, a track that plays a tone for every digit passed to
+// RecordDTMF, so that room composite egress recordings make key presses audible. Nobody in the call hears it:
+// the SIP participant does not mix its own tracks, other SIP participants skip it (see isDTMFRecordingTrack),
+// and agents listening to the caller's microphone ignore its source. Publishing waits for the server, so it
+// runs in the background to keep it off the path to answering or dialing the call; digits received before
+// it is published are not recorded.
+func (r *Room) PublishDTMFRecordingTrack() {
+	if r.room == nil {
+		return
+	}
+	p := r.room.LocalParticipant
+	go func() {
+		if err := r.publishDTMFRecordingTrack(p); err != nil {
+			r.log.Warnw("Cannot publish DTMF recording track", err)
+		}
+	}()
+}
+
+func (r *Room) publishDTMFRecordingTrack(p *lksdk.LocalParticipant) error {
+	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "dtmf", "pion")
+	if err != nil {
+		return err
+	}
+	if _, err = p.PublishTrack(track, &lksdk.TrackPublicationOptions{
+		Name:   dtmfRecordingTrackName(p.Identity()),
+		Source: dtmfRecordingTrackSource,
+	}); err != nil {
+		return err
+	}
+	ow := msdk.FromSampleWriter[opus.Sample](track, RoomSampleRate, rtp.DefFrameDur)
+	pw, err := opus.Encode(ow, channels, r.log)
+	if err != nil {
+		return err
+	}
+	frames := newDTMFToneFrames()
+	r.dtmfRec.Store(frames)
+	go runDTMFRecordingTrack(pw, frames, r.closed.Watch())
+	return nil
+}
+
+// RecordDTMF plays the digit's tone on the DTMF recording track, if one is published.
+func (r *Room) RecordDTMF(digit byte) {
+	if r == nil {
+		return
+	}
+	if frames := r.dtmfRec.Load(); frames != nil {
+		frames.Add(digit)
+	}
 }
 
 func (r *Room) SendData(data lksdk.DataPacket, opts ...lksdk.DataPublishOption) error {

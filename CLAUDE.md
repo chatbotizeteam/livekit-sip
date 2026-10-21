@@ -7,7 +7,8 @@ integration branch: upstream plus the changes listed in `zowie-changelog.md`. Re
 
 ## Every change to `zowie-custom` is a new tag
 
-1. The PR to `zowie-custom` adds an entry to `zowie-changelog.md` under a new `## zowie-X.Y.Z (date)` heading:
+1. The PR to `zowie-custom` adds an entry to `zowie-changelog.md` under a new `## zowie-X.Y.Z` heading (the
+   tag records the date):
    commit or PR, files, what it changes and why, and its upstream status ("Zowie only", or the upstream commit
    that makes it redundant). This includes dependency bumps and cherry-picks from upstream. A PR to
    `zowie-custom` without a changelog entry is not ready for review.

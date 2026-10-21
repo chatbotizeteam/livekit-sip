@@ -115,6 +115,10 @@ type Config struct {
 	AudioDTMF              bool    `yaml:"audio_dtmf"`
 	EnableJitterBuffer     bool    `yaml:"enable_jitter_buffer"`
 	EnableJitterBufferProb float64 `yaml:"enable_jitter_buffer_prob"`
+	// DTMFRecordingTone publishes an extra track that plays a tone for every DTMF digit received from SIP,
+	// so that room recordings contain key presses. Nobody in the call hears it. On by default; set it to
+	// false to turn it off.
+	DTMFRecordingTone bool `yaml:"dtmf_recording_tone"`
 
 	// internal
 	ServiceName string `yaml:"-"`
@@ -134,6 +138,8 @@ func NewConfig(confString string) (*Config, error) {
 		ApiSecret:   os.Getenv("LIVEKIT_API_SECRET"),
 		WsUrl:       os.Getenv("LIVEKIT_WS_URL"),
 		ServiceName: "sip",
+
+		DTMFRecordingTone: true,
 	}
 	if confString != "" {
 		if err := yaml.Unmarshal([]byte(confString), conf); err != nil {
