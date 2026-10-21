@@ -181,6 +181,7 @@ type Room struct {
 	closed     core.Fuse
 	stats      *RoomStats
 	dtmfRec    atomic.Pointer[dtmfToneFrames]
+	dtmfRecOn  atomic.Bool
 }
 
 type ParticipantConfig struct {
@@ -565,14 +566,18 @@ func (r *Room) NewParticipantTrack(sampleRate int) (msdk.WriteCloser[msdk.PCM16S
 // runs in the background to keep it off the path to answering or dialing the call; digits received before
 // it is published are not recorded.
 func (r *Room) PublishDTMFRecordingTrack() {
+	r.dtmfRecOn.Store(true)
 	if r.room == nil {
 		return
 	}
 	p := r.room.LocalParticipant
+	start := time.Now()
 	go func() {
 		if err := r.publishDTMFRecordingTrack(p); err != nil {
 			r.log.Warnw("Cannot publish DTMF recording track", err)
+			return
 		}
+		r.log.Infow("DTMF recording track published", "waited", time.Since(start))
 	}()
 }
 
@@ -598,13 +603,19 @@ func (r *Room) publishDTMFRecordingTrack(p *lksdk.LocalParticipant) error {
 	return nil
 }
 
-// RecordDTMF plays the digit's tone on the DTMF recording track, if one is published.
+// RecordDTMF plays the digit's tone on the DTMF recording track, if one is published. A digit that does not
+// make it into the recording is logged without its value, which may be a PIN or a card number.
 func (r *Room) RecordDTMF(digit byte) {
-	if r == nil {
+	if r == nil || !r.dtmfRecOn.Load() {
 		return
 	}
-	if frames := r.dtmfRec.Load(); frames != nil {
-		frames.Add(digit)
+	frames := r.dtmfRec.Load()
+	if frames == nil {
+		r.log.Infow("DTMF digit left out of the recording", "reason", "track not published")
+		return
+	}
+	if !frames.Add(digit) {
+		r.log.Infow("DTMF digit left out of the recording", "reason", "queue full")
 	}
 }
 

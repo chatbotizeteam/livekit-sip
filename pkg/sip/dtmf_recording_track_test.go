@@ -18,6 +18,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	msdk "github.com/livekit/media-sdk"
@@ -116,16 +117,20 @@ func TestDTMFToneFramesUnknownEventIsSilent(t *testing.T) {
 
 func TestDTMFToneFramesAddNeverBlocks(t *testing.T) {
 	g := newDTMFToneFrames()
-	done := make(chan struct{})
+	queued := make(chan []bool, 1)
 	go func() {
+		var res []bool
 		for range 2 * dtmfRecordingQueueSize {
-			g.Add('1')
+			res = append(res, g.Add('1'))
 		}
-		close(done)
+		queued <- res
 	}()
 
 	select {
-	case <-done:
+	case res := <-queued:
+		for i, ok := range res {
+			require.Equal(t, i < dtmfRecordingQueueSize, ok, "digit %d", i)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("Add blocked on a full queue")
 	}
@@ -188,6 +193,40 @@ func TestRunDTMFRecordingTrackWritesSilenceAndTones(t *testing.T) {
 	for _, frame := range written {
 		require.Len(t, frame, RoomSampleRate/int(time.Second/rtp.DefFrameDur))
 	}
+}
+
+type stallingPCMWriter struct {
+	recordingPCMWriter
+	stallAt  int
+	stallFor time.Duration
+}
+
+func (w *stallingPCMWriter) WriteSample(sample msdk.PCM16Sample) error {
+	written, _ := w.snapshot()
+	if len(written) == w.stallAt {
+		time.Sleep(w.stallFor)
+	}
+	return w.recordingPCMWriter.WriteSample(sample)
+}
+
+func TestRunDTMFRecordingTrackKeepsUpWithTheClockAfterAStall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := &stallingPCMWriter{stallAt: 5, stallFor: 5*rtp.DefFrameDur + rtp.DefFrameDur/2}
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			runDTMFRecordingTrack(out, newDTMFToneFrames(), stop)
+			close(done)
+		}()
+
+		time.Sleep(time.Second + rtp.DefFrameDur/2)
+		synctest.Wait()
+		written, _ := out.snapshot()
+		require.Len(t, written, int(time.Second/rtp.DefFrameDur))
+
+		close(stop)
+		<-done
+	})
 }
 
 func TestIsDTMFRecordingTrack(t *testing.T) {

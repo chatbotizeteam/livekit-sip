@@ -59,12 +59,14 @@ func newDTMFToneFrames() *dtmfToneFrames {
 	return &dtmfToneFrames{digits: make(chan byte, dtmfRecordingQueueSize)}
 }
 
-// Add queues a tone for the digit. It never blocks, since it is called from the RTP path:
-// digits arriving while the queue is full are left out of the recording.
-func (g *dtmfToneFrames) Add(digit byte) {
+// Add queues a tone for the digit and reports whether it was queued. It never blocks, since it is called
+// from the RTP path: digits arriving while the queue is full are left out of the recording.
+func (g *dtmfToneFrames) Add(digit byte) bool {
 	select {
 	case g.digits <- digit:
+		return true
 	default:
+		return false
 	}
 }
 
@@ -83,23 +85,28 @@ func (g *dtmfToneFrames) Next(buf msdk.PCM16Sample, dur time.Duration) {
 	g.remaining -= dur
 }
 
-// runDTMFRecordingTrack writes a frame to out every rtp.DefFrameDur until stop is closed.
+// runDTMFRecordingTrack writes a frame to out for every rtp.DefFrameDur of wall time until stop is closed.
 // The track carries silence between tones on purpose: RTP timestamps advance with the samples written,
 // so a track carrying tones only would place every tone right after the previous one in the recording.
+// For the same reason it counts frames against the clock, not ticks: a ticker drops ticks when the loop
+// is late, and every dropped tick would leave the track a frame behind for the rest of the call.
 func runDTMFRecordingTrack(out msdk.PCM16Writer, frames *dtmfToneFrames, stop <-chan struct{}) {
 	defer out.Close()
 	buf := make(msdk.PCM16Sample, out.SampleRate()/int(time.Second/rtp.DefFrameDur))
 	ticker := time.NewTicker(rtp.DefFrameDur)
 	defer ticker.Stop()
+	next := time.Now().Add(rtp.DefFrameDur)
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
 		}
-		frames.Next(buf, rtp.DefFrameDur)
-		if err := out.WriteSample(buf); err != nil {
-			return
+		for now := time.Now(); !next.After(now); next = next.Add(rtp.DefFrameDur) {
+			frames.Next(buf, rtp.DefFrameDur)
+			if err := out.WriteSample(buf); err != nil {
+				return
+			}
 		}
 	}
 }

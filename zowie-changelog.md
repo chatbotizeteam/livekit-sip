@@ -33,7 +33,11 @@ Minor: a new feature, on by default.
     recording track of another SIP participant (transfer leg).
   - Agents do not hear it: livekit-agents `RoomIO` takes only the `SOURCE_MICROPHONE` track.
   - The track is published in the background, off the path to answering or dialing the call; digits received
-    before it is published are not recorded.
+    before it is published are not recorded. Those digits, and digits dropped while 16 are already waiting, are
+    logged ("DTMF digit left out of the recording", without the digit's value); the publish itself is logged
+    with the time it took ("DTMF recording track published").
+  - Frames are counted against the wall clock, so a late loop catches up instead of shifting later tones
+    earlier in the recording.
 - **Config:** `dtmf_recording_tone`, **on by default**; set it to `false` to turn it off.
 - **Deploy order:** roll out the livekit-agent change from platform/monorepo!17746 (egress `DUAL_CHANNEL_AGENT`,
   voicemail detection on the microphone track only) in EU and US before a SIP image with this change. With the
