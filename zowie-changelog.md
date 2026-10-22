@@ -17,6 +17,34 @@ which bumps protocol to v1.45.1 (protocol #1456 "Dropping sip affinity use"); fr
 affinity 1 for every node, so outbound routing ignores load, `max_active_calls` and `sip_trunk_ids`.
 The newest upstream commit that still has affinity is 450ffb7 (#638, 2026-03-28).
 
+## zowie-1.2.0
+
+Minor: a new feature.
+
+### Expose the negotiated audio codec as SIP participant attributes (AG-1360)
+
+- **PR:** [#2](https://github.com/chatbotizeteam/livekit-sip/pull/2) (`sip-audio-codec-attributes` → `zowie-custom`)
+- **Files:** `pkg/sip/media_attrs.go` (new), `pkg/sip/media_attrs_test.go` (new), `pkg/sip/participant.go`,
+  `pkg/sip/inbound.go`, `pkg/sip/outbound.go`
+- **What:** two new participant attributes: `sip.audioCodec` (SDP name, e.g. `PCMA/8000`) and
+  `sip.audioSampleRate` (the codec's real sample rate: `8000` for G.711, `16000` for G.722, whose SDP clock rate
+  says 8000). Inbound calls carry them from the moment the participant joins, since the codec is negotiated
+  before the room is joined. Outbound calls get them through `SetAttributes` once the callee answers.
+  - The livekit-agent (platform/monorepo!17762) streams speech to Azure at 8 kHz when `sip.audioSampleRate` is
+    `8000` and the recognizer's `automatically_adjust_sample_rate` is on, **which is the default**. Without the
+    attribute it keeps 16 kHz.
+- **Deploy order:** this image is what switches calls to 8 kHz. Per region:
+  1. The livekit-agent change from platform/monorepo!17762 deployed and every old pod drained.
+  2. `automatically_adjust_sample_rate: false` written on the Azure recognizers of the numbers that must stay at
+     16 kHz (Payoneer ko-KR and ja-JP; see the MR).
+  3. This image on every SIP host of the region.
+  - **Rollback:** going back to an image without this change returns every call to 16 kHz; the agent does not
+    need to move.
+- **Upstream status:** Zowie only. Upstream keeps the codec only in `SIPCallInfo.AudioCodec` for analytics
+  (checked on upstream main, 2026-10-20). Upstream 21fa436 (#837, "Support codec parameters") moves the codec
+  to `audio.Info`; when rebasing past it, rewrite `withAudioCodecAttrs` and keep `sip.audioCodec` as
+  `name/clockRate` (e.g. `PCMA/8000`), which `media_attrs_test.go` checks.
+
 ## zowie-1.1.0
 
 Minor: a new feature, on by default.

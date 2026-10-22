@@ -568,6 +568,18 @@ func (c *outboundCall) setExtraAttrs(hdrToAttr map[string]string, opts livekit.S
 	}
 }
 
+func (c *outboundCall) setAudioCodecAttrs(mc *MediaConf) {
+	attrs := withAudioCodecAttrs(nil, mc)
+	if c.lkRoom == nil || len(attrs) == 0 {
+		return
+	}
+	if room := c.lkRoom.Room(); room != nil {
+		room.LocalParticipant.SetAttributes(attrs)
+	} else {
+		c.log.Warnw("could not set audio codec attributes on nil room", nil, "attrs", attrs)
+	}
+}
+
 func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	ctx, span := Tracer.Start(ctx, "sip.outbound.sipSignal")
 	defer span.End()
@@ -669,6 +681,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	joinDur()
 
 	c.setExtraAttrs(c.sipConf.headersToAttrs, c.sipConf.includeHeaders, c.cc, nil)
+	c.setAudioCodecAttrs(mc)
 	c.state.DeferUpdate(func(info *livekit.SIPCallInfo) {
 		info.AudioCodec = mc.Audio.Codec.Info().SDPName
 		if r := c.lkRoom.Room(); r != nil {
