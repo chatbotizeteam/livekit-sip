@@ -17,6 +17,38 @@ which bumps protocol to v1.45.1 (protocol #1456 "Dropping sip affinity use"); fr
 affinity 1 for every node, so outbound routing ignores load, `max_active_calls` and `sip_trunk_ids`.
 The newest upstream commit that still has affinity is 450ffb7 (#638, 2026-03-28).
 
+## zowie-1.2.1
+
+Patch: a fix.
+
+### Write silence for the audio that a DTMF key press replaces (AG-1515)
+
+- **PR:** `fix/dtmf-silence-fill` → `zowie-custom`
+- **Files:** `pkg/sip/silence_filler.go`, `pkg/sip/media_port.go`, tests
+- **Problem:** a phone that sends a key press as RFC 4733 events sends no audio for its duration. The silence
+  filler saw only audio packets and treated the gap as packet loss, so it wrote nothing. The caller's track in
+  the room advances by the frames written to it, not by the clock, so every key press moved the rest of the
+  caller's audio earlier in recordings. The agent hears the caller on time; only the recording is off.
+  - Measured on Orange prod (2026-11-19, 125 calls with key presses): events and audio share one RTP stream at
+    a constant 50 packets/s, and the caller's track lost a median of 2.3 s per call, up to 12.1 s.
+  - On Payoneer recordings the caller is 1 to 2.5 s early after a series of keys, and in some calls the
+    caller's channel is digital silence from the middle of the series to the end of the call (AG-1515). The
+    likely reason for the latter is that egress drops audio that is further behind than its mixer latency;
+    this is not confirmed from egress logs.
+- **What:** the filler now gets the event packets too.
+  - While the key is down it writes silence frame by frame, one frame behind the event and never more than the
+    time that has passed since the last audio packet. Listeners therefore do not get a burst of frames before
+    the caller's next words, and a phone that keeps sending audio during a key press gets nothing added.
+  - On the first audio packet after the key press it fills the rest of the timestamp gap, up to 5 s, whatever
+    the sequence numbers say. A larger gap is treated as a timestamp reset and left alone.
+  - Packet loss and silence suppression without key presses behave as before.
+- **How to verify on a host:** in the final `call statistics` log line of a call with key presses,
+  `audio_in_frames` is close to `audio_packets + dtmf_packets` (before: equal to `audio_packets`), and
+  `published_frames` is close to `packets`.
+- **Deploy order:** none; the agent does not need to move. **Rollback:** pin `zowie-1.2.0`.
+- **Upstream status:** Zowie only. Upstream has the same filler (checked on upstream main `e0e5cda`,
+  2026-11-19); there it is created in `pkg/sip/media_pipeline.go`.
+
 ## zowie-1.2.0
 
 Minor: a new feature.

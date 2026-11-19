@@ -28,6 +28,7 @@ import (
 	"time"
 
 	msdk "github.com/livekit/media-sdk"
+	"github.com/livekit/media-sdk/dtmf"
 	"github.com/livekit/media-sdk/rtp"
 	"github.com/livekit/media-sdk/sdp"
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
@@ -541,4 +542,57 @@ func TestMediaTimeout(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A key press sent as RFC 4733 events in place of audio, in the same RTP stream, must not shorten the audio
+// passed on to the room: every event packet stands for one audio frame.
+func TestMediaPortDTMFKeepsAudioTimeline(t *testing.T) {
+	const (
+		before     = 10 // audio packets before the key press
+		events     = 7  // 5 packets while the key is down, then the end packet repeated twice
+		eventDur   = 5
+		after      = 5 // audio packets after it
+		tsPerFrame = 160
+	)
+	m1, m2 := newMediaPair(t, nil, nil)
+
+	var digits atomic.Value
+	m2.HandleDTMF(func(ev dtmf.Event) {
+		digits.Store(string(ev.Digit))
+	})
+
+	audio, event := m1.audioOutRTP, m1.dtmfOutRTP
+	require.NotNil(t, audio)
+	require.NotNil(t, event)
+
+	frame := make([]byte, 160) // 20 ms of G722
+	sendAudio := func(n int) {
+		for range n {
+			require.NoError(t, audio.WritePayload(frame, false))
+			time.Sleep(rtp.DefFrameDur)
+		}
+	}
+
+	sendAudio(before)
+	event.ResetTimestamp(audio.GetCurrentTimestamp())
+	for i := range events {
+		dur := min(i+1, eventDur)
+		var payload [4]byte
+		_, err := dtmf.Encode(payload[:], dtmf.Event{Digit: '5', Dur: uint16(dur * tsPerFrame), End: dur == eventDur})
+		require.NoError(t, err)
+		require.NoError(t, event.WritePayloadAtCurrent(payload[:], i == 0))
+		time.Sleep(rtp.DefFrameDur)
+	}
+	audio.Delay(events * tsPerFrame)
+	sendAudio(after)
+
+	require.Eventually(t, func() bool {
+		return m2.stats.AudioPackets.Load() == before+after && m2.stats.DTMFPackets.Load() == events
+	}, time.Second, 10*time.Millisecond)
+
+	st := m2.stats.Load()
+	require.EqualValues(t, 1, st.Streams)
+	require.Equal(t, st.Packets, st.AudioPackets+st.DTMFPackets)
+	require.EqualValues(t, before+events+after, st.AudioInFrames, "silence must replace the audio missing during the key press")
+	require.Equal(t, "5", digits.Load())
 }

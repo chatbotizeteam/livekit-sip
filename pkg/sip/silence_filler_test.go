@@ -17,8 +17,10 @@ package sip
 import (
 	"slices"
 	"testing"
+	"time"
 
 	msdk "github.com/livekit/media-sdk"
+	"github.com/livekit/media-sdk/dtmf"
 	"github.com/livekit/media-sdk/rtp"
 	"github.com/livekit/protocol/logger"
 	"github.com/stretchr/testify/require"
@@ -33,6 +35,8 @@ type SilenceSuppressionTester struct {
 	receivedSignalFrames  uint64
 	sampleCounts          []int // number of samples in each silence frame
 	gapFiller             rtp.Handler
+	filler                *silenceFiller
+	clock                 time.Time // arrival time of the packet being sent
 }
 
 type silenceSuppressionTesterOption func(*SilenceSuppressionTester)
@@ -55,7 +59,10 @@ func newSilenceSuppressionTester(audioSampleRate int, log logger.Logger, options
 	for _, option := range options {
 		option(tester)
 	}
-	tester.gapFiller = newSilenceFiller(tester, tester, tester.clockRate, tester.audioSampleRate, log)
+	tester.clock = time.Unix(1_000_000, 0)
+	tester.filler = newSilenceFiller(tester, tester, tester.clockRate, tester.audioSampleRate, log)
+	tester.filler.now = func() time.Time { return tester.clock }
+	tester.gapFiller = tester.filler
 	return tester
 }
 
@@ -96,12 +103,37 @@ func (s *SilenceSuppressionTester) SendSignalFrames(count int, nextSeq uint16, n
 		nextSeq++
 		nextTimestamp += uint32(clockPerFrame)
 		payload := make([]byte, samplesPerFrame)
+		s.clock = s.clock.Add(rtp.DefFrameDur)
 		err := s.gapFiller.HandleRTP(h, payload)
 		if err != nil {
 			return nextSeq, nextTimestamp, err
 		}
 	}
 	return nextSeq, nextTimestamp, nil
+}
+
+// SendDTMF sends the telephone-event packets of one key press that starts at eventTS: count packets, step apart.
+// Packet i reports a duration of i+1 frames, capped at durFrames, as when a sender repeats the end packet.
+func (s *SilenceSuppressionTester) SendDTMF(count, durFrames int, nextSeq uint16, eventTS uint32, step time.Duration) (uint16, error) {
+	clockPerFrame := s.clockRate / rtp.DefFramesPerSec
+	for i := 0; i < count; i++ {
+		dur := min(i+1, durFrames)
+		var payload [4]byte
+		if _, err := dtmf.Encode(payload[:], dtmf.Event{Digit: '5', Dur: uint16(dur * clockPerFrame), End: dur == durFrames}); err != nil {
+			return nextSeq, err
+		}
+		h := &rtp.Header{
+			SequenceNumber: nextSeq,
+			Timestamp:      eventTS,
+			Marker:         i == 0,
+		}
+		nextSeq++
+		s.clock = s.clock.Add(step)
+		if err := s.filler.HandleDTMF(h, payload[:]); err != nil {
+			return nextSeq, err
+		}
+	}
+	return nextSeq, nil
 }
 
 func (s *SilenceSuppressionTester) assertSilenceIndexes(t *testing.T, expectedSize int, silenceIndexes []int) {
@@ -298,4 +330,251 @@ func TestSilenceSuppressionDifferentCodecs(t *testing.T) {
 			tester.assertSilenceIndexes(t, 12, []int{5, 6})
 		})
 	}
+}
+
+// A phone that sends a key press as RFC 4733 events stops sending audio for its duration. The caller's track in the
+// room advances by the frames written to it, so the filler has to write silence for that time.
+func TestSilenceFillerDTMF(t *testing.T) {
+	const (
+		sampleRate = 8000
+		tsPerFrame = uint32(sampleRate / rtp.DefFramesPerSec)
+		startSeq   = uint16(100)
+		startTS    = uint32(10000)
+		before     = 10 // audio frames before the key press
+		after      = 5  // audio frames after it
+	)
+	log := logger.GetLogger()
+
+	silence := func(from, count int) []int {
+		idx := make([]int, count)
+		for i := range idx {
+			idx[i] = from + i
+		}
+		return idx
+	}
+
+	t.Run("events replace audio in the same stream", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		// 5 packets while the key is down, then the end packet repeated twice: 7 frames without audio.
+		seq, err = tester.SendDTMF(7, 5, seq, ts, rtp.DefFrameDur)
+		require.NoError(t, err)
+		// Silence is written while the key is down, one frame behind the event.
+		require.EqualValues(t, 4, tester.receivedSilenceFrames)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+7*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+7+after, silence(before, 7))
+	})
+
+	t.Run("events have their own sequence numbers", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		_, err = tester.SendDTMF(7, 5, 5000, ts, rtp.DefFrameDur)
+		require.NoError(t, err)
+
+		// No sequence gap in the audio: the gap must not be filled twice.
+		_, _, err = tester.SendSignalFrames(after, seq, ts+7*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+7+after, silence(before, 7))
+	})
+
+	t.Run("key held longer than the silence suppression limit", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		const held = 40 // 800 ms
+		seq, err = tester.SendDTMF(held, held, seq, ts, rtp.DefFrameDur)
+		require.NoError(t, err)
+		require.EqualValues(t, held-1, tester.receivedSilenceFrames)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+held*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+held+after, silence(before, held))
+	})
+
+	t.Run("two key presses without audio in between", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		seq, err = tester.SendDTMF(7, 5, seq, ts, rtp.DefFrameDur)
+		require.NoError(t, err)
+		seq, err = tester.SendDTMF(7, 5, seq, ts+7*tsPerFrame, rtp.DefFrameDur)
+		require.NoError(t, err)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+14*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+14+after, silence(before, 14))
+	})
+
+	t.Run("events arrive in a burst", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		// No time has passed since the last audio packet, so nothing may be written yet.
+		seq, err = tester.SendDTMF(7, 5, seq, ts, 0)
+		require.NoError(t, err)
+		require.EqualValues(t, 0, tester.receivedSilenceFrames)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+7*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+7+after, silence(before, 7))
+	})
+
+	t.Run("event timestamps far ahead of the audio", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		// Never more silence than the time that has passed since the last audio packet.
+		seq, err = tester.SendDTMF(5, 5, seq, ts+1000*tsPerFrame, rtp.DefFrameDur)
+		require.NoError(t, err)
+		require.EqualValues(t, 4, tester.receivedSilenceFrames)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+5*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+5+after, silence(before, 5))
+	})
+
+	t.Run("event timestamps behind the audio", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		seq, err = tester.SendDTMF(5, 5, seq, ts-1000*tsPerFrame, rtp.DefFrameDur)
+		require.NoError(t, err)
+		require.EqualValues(t, 0, tester.receivedSilenceFrames)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+5*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+5+after, silence(before, 5))
+	})
+
+	t.Run("audio resumes after more than the fill limit", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		seq, err = tester.SendDTMF(3, 3, seq, ts, rtp.DefFrameDur)
+		require.NoError(t, err)
+
+		// 300 frames (6 s) later: likely a timestamp reset, the rest is not filled.
+		_, _, err = tester.SendSignalFrames(after, seq, ts+300*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+2+after, silence(before, 2))
+	})
+
+	t.Run("gap up to the fill limit is filled when audio resumes", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		seq, err = tester.SendDTMF(3, 3, seq, ts, 0)
+		require.NoError(t, err)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+200*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+200+after, silence(before, 200))
+	})
+
+	t.Run("audio keeps flowing during the key press", func(t *testing.T) {
+		for _, eventFirst := range []bool{false, true} {
+			tester := newSilenceSuppressionTester(sampleRate, log)
+			seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+			require.NoError(t, err)
+
+			// One audio and one event packet every 20 ms, sharing sequence numbers.
+			eventTS := ts
+			for i := 0; i < 10; i++ {
+				var payload [4]byte
+				_, err := dtmf.Encode(payload[:], dtmf.Event{Digit: '5', Dur: uint16(uint32(i+1) * tsPerFrame)})
+				require.NoError(t, err)
+				event := func() {
+					require.NoError(t, tester.filler.HandleDTMF(&rtp.Header{SequenceNumber: seq, Timestamp: eventTS, Marker: i == 0}, payload[:]))
+					seq++
+				}
+				tester.clock = tester.clock.Add(rtp.DefFrameDur)
+				if eventFirst {
+					event()
+				}
+				tester.clock = tester.clock.Add(-rtp.DefFrameDur) // SendSignalFrames advances the clock itself
+				seq, ts, err = tester.SendSignalFrames(1, seq, ts)
+				require.NoError(t, err)
+				if !eventFirst {
+					event()
+				}
+			}
+			tester.assertSilenceIndexes(t, before+10, []int{})
+		}
+	})
+
+	t.Run("packet loss without events is still not filled", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		_, _, err = tester.SendSignalFrames(after, seq+3, ts+3*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+after, []int{})
+	})
+
+	t.Run("events before any audio", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, err := tester.SendDTMF(7, 5, startSeq, startTS, rtp.DefFrameDur)
+		require.NoError(t, err)
+
+		_, _, err = tester.SendSignalFrames(after, seq, startTS+7*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, after, []int{})
+	})
+
+	t.Run("malformed event", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		tester.clock = tester.clock.Add(3 * rtp.DefFrameDur)
+		require.NoError(t, tester.filler.HandleDTMF(&rtp.Header{SequenceNumber: seq, Timestamp: ts}, []byte{5}))
+		require.EqualValues(t, 0, tester.receivedSilenceFrames)
+
+		// It still marks a key press, so the gap is filled when audio resumes.
+		_, _, err = tester.SendSignalFrames(after, seq+1, ts+3*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+3+after, silence(before, 3))
+	})
+
+	t.Run("timestamp wrap-around during the key press", func(t *testing.T) {
+		tester := newSilenceSuppressionTester(sampleRate, log)
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, 0xFFFFFFFF-12*tsPerFrame)
+		require.NoError(t, err)
+
+		seq, err = tester.SendDTMF(7, 5, seq, ts, rtp.DefFrameDur)
+		require.NoError(t, err)
+		require.EqualValues(t, 4, tester.receivedSilenceFrames)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+7*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+7+after, silence(before, 7))
+	})
+
+	t.Run("G722", func(t *testing.T) {
+		// 8 kHz RTP clock, 16 kHz audio: silence frames must have the PCM frame size.
+		tester := newSilenceSuppressionTester(16000, log, WithClockRate(8000))
+		seq, ts, err := tester.SendSignalFrames(before, startSeq, startTS)
+		require.NoError(t, err)
+
+		seq, err = tester.SendDTMF(7, 5, seq, ts, rtp.DefFrameDur)
+		require.NoError(t, err)
+
+		_, _, err = tester.SendSignalFrames(after, seq, ts+7*tsPerFrame)
+		require.NoError(t, err)
+		tester.assertSilenceIndexes(t, before+7+after, silence(before, 7))
+	})
 }

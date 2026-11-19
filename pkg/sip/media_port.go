@@ -835,7 +835,8 @@ func (p *MediaPort) setupInput() {
 	}
 	audioHandler := p.conf.Audio.Codec.DecodeRTP(audioWriter, p.conf.Audio.Type)
 	// Wrap the decoder with silence suppression handler to fill gaps during silence suppression
-	audioHandler = newSilenceFiller(audioHandler, audioWriter, codecInfo.RTPClockRate, codecInfo.SampleRate, p.log)
+	filler := newSilenceFiller(audioHandler, audioWriter, codecInfo.RTPClockRate, codecInfo.SampleRate, p.log)
+	audioHandler = filler
 	p.audioInHandler = audioHandler
 
 	mux := rtp.NewMux(nil)
@@ -847,9 +848,18 @@ func (p *MediaPort) setupInput() {
 		),
 	)
 	if p.conf.Audio.DTMFType != 0 {
+		// The filler writes silence for the audio that a key press replaces; see silenceFiller.HandleDTMF.
+		dtmfHandler := rtp.HandlerFunc(func(h *rtp.Header, payload []byte) error {
+			// A failed write of silence must not cost the digit.
+			fillErr := filler.HandleDTMF(h, payload)
+			if err := p.dtmfHandler(h, payload); err != nil {
+				return err
+			}
+			return fillErr
+		})
 		mux.Register(
 			p.conf.Audio.DTMFType, newRTPHandlerCount(
-				newRTPStatsHandler(p.mon, dtmf.SDPName, rtp.HandlerFunc(p.dtmfHandler)),
+				newRTPStatsHandler(p.mon, dtmf.SDPName, dtmfHandler),
 				&p.stats.DTMFPackets, &p.stats.DTMFBytes,
 			),
 		)

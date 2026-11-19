@@ -20,6 +20,7 @@ import (
 	"time"
 
 	msdk "github.com/livekit/media-sdk"
+	"github.com/livekit/media-sdk/dtmf"
 	"github.com/livekit/media-sdk/rtp"
 	"github.com/livekit/protocol/logger"
 )
@@ -39,6 +40,13 @@ type silenceFiller struct {
 	gapCount              atomic.Uint64
 	gapSizeSum            atomic.Uint64
 	lastPrintTime         time.Time
+
+	// DTMF gap state. Audio and DTMF packets come from the same RTP mux, so it is only touched from the RTP read path.
+	now         func() time.Time
+	lastAudioAt time.Time // arrival of the last audio packet
+	dtmfActive  bool      // a DTMF packet arrived since the last audio packet
+	dtmfNextTS  uint32    // RTP timestamp up to which the audio timeline is filled during the DTMF gap
+	dtmfFilled  int       // silence frames written during the DTMF gap so far
 }
 
 type SilenceSuppressionOption func(*silenceFiller)
@@ -51,7 +59,7 @@ func WithMaxGapSize(maxGapSize int) SilenceSuppressionOption {
 	}
 }
 
-func newSilenceFiller(encodedSink rtp.Handler, pcmSink msdk.PCM16Writer, rtpClockRate int, pcmSampleRate int, log logger.Logger, options ...SilenceSuppressionOption) rtp.Handler {
+func newSilenceFiller(encodedSink rtp.Handler, pcmSink msdk.PCM16Writer, rtpClockRate int, pcmSampleRate int, log logger.Logger, options ...SilenceSuppressionOption) *silenceFiller {
 	// TODO: We assume 20ms frame. We would need to adjust this when:
 	// - When we add support for other frame durations.
 	// - When we add support for re-INVITE sdp renegotiation (maybe, if we don't destroy this and start over).
@@ -68,6 +76,7 @@ func newSilenceFiller(encodedSink rtp.Handler, pcmSink msdk.PCM16Writer, rtpCloc
 		gapCount:           atomic.Uint64{},
 		gapSizeSum:         atomic.Uint64{},
 		lastPrintTime:      time.Time{},
+		now:                time.Now,
 	}
 	for _, option := range options {
 		option(h)
@@ -125,6 +134,27 @@ func (h *silenceFiller) fillWithSilence(framesToFill int) error {
 
 func (h *silenceFiller) HandleRTP(header *rtp.Header, payload []byte) error {
 	isSilenceSupression, missingFrameCount := h.isSilenceSuppression(header)
+	h.lastAudioAt = h.now()
+
+	if h.dtmfActive {
+		// First audio packet after a key press: fill what HandleDTMF has not, whatever the sequence numbers say.
+		h.dtmfActive = false
+		remaining := int(int32(header.Timestamp-h.dtmfNextTS)) / h.rtpSamplesPerFrame
+		if remaining > 0 && remaining <= dtmfMaxResumeGap {
+			if err := h.fillWithSilence(remaining); err != nil {
+				return err
+			}
+		} else {
+			remaining = 0
+		}
+		h.log.Debugw("filled DTMF gap",
+			"rtpSeq", header.SequenceNumber,
+			"rtpTimestamp", header.Timestamp,
+			"gapSize", h.dtmfFilled+remaining,
+			"filledOnResume", remaining,
+		)
+		return h.encodedSink.HandleRTP(header, payload)
+	}
 
 	if isSilenceSupression && missingFrameCount <= h.maxGapSize*100 {
 		//  <= h.maxGapSize * 100 done to filter out what is most likely an RTP reset
@@ -151,4 +181,47 @@ func (h *silenceFiller) HandleRTP(header *rtp.Header, payload []byte) error {
 		}
 	}
 	return h.encodedSink.HandleRTP(header, payload)
+}
+
+// dtmfMaxResumeGap is the largest gap, in frames, filled at once when audio resumes after a key press (5 s).
+// A larger one is most likely an RTP timestamp reset.
+const dtmfMaxResumeGap = 250
+
+// HandleDTMF is called for every RFC 4733 telephone-event packet, including the ones that do not start a digit.
+//
+// A phone that sends a key press as events sends no audio for its duration, usually in the same RTP stream, so
+// the next audio packet has both a sequence and a timestamp gap, which HandleRTP alone treats as packet loss.
+// The caller's track in the room advances by the frames written to it, not by the clock, so every missing frame
+// moves the rest of the caller's audio 20 ms earlier in recordings.
+//
+// Silence is written while the key is down instead of all at once when audio resumes, so that listeners do not
+// receive a burst of frames to play out before the caller's next words. It stays one frame behind both the
+// event and the time since the last audio packet: a phone that keeps sending audio during the key press must
+// not get silence added, and event timestamps are not trusted beyond the time that has really passed.
+func (h *silenceFiller) HandleDTMF(header *rtp.Header, payload []byte) error {
+	if h.packets.Load() == 0 {
+		return nil // no audio timeline to fill yet
+	}
+	if !h.dtmfActive {
+		h.dtmfActive = true
+		h.dtmfNextTS = uint32(h.lastTS.Load()) + uint32(h.rtpSamplesPerFrame)
+		h.dtmfFilled = 0
+	}
+	ev, err := dtmf.Decode(payload)
+	if err != nil {
+		return nil // HandleRTP still fills the gap when audio resumes
+	}
+	eventEnd := header.Timestamp + uint32(ev.Dur)
+	byEvent := int(int32(eventEnd-h.dtmfNextTS))/h.rtpSamplesPerFrame - 1
+	byClock := int(h.now().Sub(h.lastAudioAt)/rtp.DefFrameDur) - 1 - h.dtmfFilled
+	frames := min(byEvent, byClock)
+	if frames <= 0 {
+		return nil
+	}
+	if err := h.fillWithSilence(frames); err != nil {
+		return err
+	}
+	h.dtmfNextTS += uint32(frames * h.rtpSamplesPerFrame)
+	h.dtmfFilled += frames
+	return nil
 }
