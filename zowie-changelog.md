@@ -17,6 +17,35 @@ which bumps protocol to v1.45.1 (protocol #1456 "Dropping sip affinity use"); fr
 affinity 1 for every node, so outbound routing ignores load, `max_active_calls` and `sip_trunk_ids`.
 The newest upstream commit that still has affinity is 450ffb7 (#638, 2026-03-28).
 
+## zowie-1.2.1
+
+Patch: a fix.
+
+### Keep the caller's track on time through DTMF key presses (AG-1515)
+
+- **PR:** (`fix/AG-1515/dtmf-silence-fill` → `zowie-custom`)
+- **Files:** `pkg/sip/silence_filler.go`, `pkg/sip/media_port.go`, `pkg/sip/silence_filler_dtmf_test.go` (new),
+  `pkg/sip/media_port_dtmf_test.go` (new)
+- **What:** a phone that sends a key press as RFC 4733 events sends no audio for its duration, in the same RTP
+  stream. The mux routes the events to the DTMF handler, so `silenceFiller` never saw them: the next audio packet
+  had a sequence gap and was taken for packet loss, and no silence was written. The caller's track in the room
+  advances by the frames written to it, so every key press moved the rest of the caller's audio earlier in
+  room composite recordings by its duration (Payoneer: up to 3.4 s after a customer ID, ~0.17 s per key).
+  Listeners in the room heard the caller on time. In about 1 in 8 Payoneer calls with key presses the caller's
+  channel is also silent from the last key to the end of the recording; that starts at a key press too, but its
+  mechanism is not confirmed, so whether this release removes it is to be measured after the deploy.
+  - The DTMF handler now passes every event packet to the filler first. The time an event covers is filled with
+    silence while the key is down, paced by the clock and one frame behind it, and the rest when audio resumes,
+    so the track keeps the wall clock without a burst of frames. Gaps before and after an event, with neither
+    audio nor events, are silence suppression and keep its 25-frame limit.
+  - Nothing is added for a phone that keeps sending audio during the key press, or for events in another SSRC
+    than the audio (the audio sequence numbers have no gap then).
+  - The digit is handled even when writing the silence fails.
+  - New `call statistics` field `dtmf_silence_frames`: silence frames written for DTMF events.
+- **Not covered:** events in their own SSRC with a key press longer than 500 ms (no such stream seen), and
+  recordings made before this release.
+- **Upstream status:** Zowie only. Upstream main has the same `silenceFiller` (checked 2026-11-24).
+
 ## zowie-1.2.0
 
 Minor: a new feature.

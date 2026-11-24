@@ -77,8 +77,9 @@ type PortStatsSnapshot struct {
 	AudioRX float64 `json:"audio_rx"`
 	AudioTX float64 `json:"audio_tx"`
 
-	DTMFPackets uint64 `json:"dtmf_packets"`
-	DTMFBytes   uint64 `json:"dtmf_bytes"`
+	DTMFPackets       uint64 `json:"dtmf_packets"`
+	DTMFBytes         uint64 `json:"dtmf_bytes"`
+	DTMFSilenceFrames uint64 `json:"dtmf_silence_frames"`
 
 	JitterBufferPacketsLost    uint64 `json:"jitter_buffer_packets_lost"`
 	JitterBufferPacketsDropped uint64 `json:"jitter_buffer_packets_dropped"`
@@ -106,8 +107,9 @@ type PortStats struct {
 	AudioRX atomic.Uint64 // based on AudioInSamples
 	AudioTX atomic.Uint64 // based on AudioOutSamples
 
-	DTMFPackets atomic.Uint64
-	DTMFBytes   atomic.Uint64
+	DTMFPackets       atomic.Uint64
+	DTMFBytes         atomic.Uint64
+	DTMFSilenceFrames atomic.Uint64 // silence written for the audio that DTMF events replace, and the gaps around them
 
 	JitterBufferPacketsLost    atomic.Uint64
 	JitterBufferPacketsDropped atomic.Uint64
@@ -149,6 +151,7 @@ func (s *PortStats) Load() PortStatsSnapshot {
 		AudioTX:                    math.Float64frombits(s.AudioTX.Load()),
 		DTMFPackets:                s.DTMFPackets.Load(),
 		DTMFBytes:                  s.DTMFBytes.Load(),
+		DTMFSilenceFrames:          s.DTMFSilenceFrames.Load(),
 		JitterBufferPacketsLost:    s.JitterBufferPacketsLost.Load(),
 		JitterBufferPacketsDropped: s.JitterBufferPacketsDropped.Load(),
 		Closed:                     s.Closed.Load(),
@@ -835,7 +838,12 @@ func (p *MediaPort) setupInput() {
 	}
 	audioHandler := p.conf.Audio.Codec.DecodeRTP(audioWriter, p.conf.Audio.Type)
 	// Wrap the decoder with silence suppression handler to fill gaps during silence suppression
-	audioHandler = newSilenceFiller(audioHandler, audioWriter, codecInfo.RTPClockRate, codecInfo.SampleRate, p.log)
+	var fillerOpts []SilenceSuppressionOption
+	if p.stats != nil {
+		fillerOpts = append(fillerOpts, withEventFrameCounter(&p.stats.DTMFSilenceFrames))
+	}
+	filler := newSilenceFiller(audioHandler, audioWriter, codecInfo.RTPClockRate, codecInfo.SampleRate, p.log, fillerOpts...)
+	audioHandler = filler
 	p.audioInHandler = audioHandler
 
 	mux := rtp.NewMux(nil)
@@ -849,7 +857,15 @@ func (p *MediaPort) setupInput() {
 	if p.conf.Audio.DTMFType != 0 {
 		mux.Register(
 			p.conf.Audio.DTMFType, newRTPHandlerCount(
-				newRTPStatsHandler(p.mon, dtmf.SDPName, rtp.HandlerFunc(p.dtmfHandler)),
+				newRTPStatsHandler(p.mon, dtmf.SDPName, rtp.HandlerFunc(func(h *rtp.Header, payload []byte) error {
+					// The filler writes silence for the audio that the key press replaces. Its error must not
+					// cost the digit, so the digit is handled anyway and the error returned after.
+					fillErr := filler.HandleEvent(h, payload)
+					if err := p.dtmfHandler(h, payload); err != nil {
+						return err
+					}
+					return fillErr
+				})),
 				&p.stats.DTMFPackets, &p.stats.DTMFBytes,
 			),
 		)
